@@ -97,8 +97,8 @@ class MVT(nn.Module):
         :param out: output from mvt
         :param y_q: refer to the definition in mvt_single.get_wpt
         """
-        wpt = self.mvt1.get_wpt(out, dyn_cam_info, y_q)
-        return wpt
+        wpt, wpt_conf = self.mvt1.get_wpt(out, dyn_cam_info, y_q)
+        return wpt, wpt_conf
 
     def render(self, pc, img_feat, img_aug, dyn_cam_info):
         mvt = self.mvt1

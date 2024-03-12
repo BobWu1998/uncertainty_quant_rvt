@@ -622,6 +622,7 @@ class BoxRenderer:
             pts_hm.append(dyn_pts_hm)
 
         pts_hm = torch.cat(pts_hm, 0)
+
         return pts_hm, self._pts
 
     @torch.no_grad()
@@ -654,9 +655,20 @@ class BoxRenderer:
         pts_hm = pts_hm.permute(2, 1, 0)
         # (bs, np)
         pts_hm = torch.mean(pts_hm, -1)
+
+        # import pdb
+        # pdb.set_trace()
         # (bs)
         ind_max_pts = torch.argmax(pts_hm, -1)
-        return pts[ind_max_pts]
+        
+        # using the mean of the max value in each heatmap individually
+        # we cannot directly extract the max from pts_hm b/c it's expensive to normalize such a huge space
+        batch_size, channels = hm.shape[0], hm.shape[1]
+        flattened_hm = hm.view(batch_size, channels, -1)
+        max_values, _ = flattened_hm.max(dim=-1)
+        pt_conf = max_values.mean(dim=-1)
+        # pt_conf, _ = torch.max(pts_hm, -1)
+        return pts[ind_max_pts], pt_conf
 
     def free_mem(self):
         """

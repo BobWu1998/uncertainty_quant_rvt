@@ -24,6 +24,10 @@ from yarr.agents.agent import ActResult
 from rvt.utils.dataset import _clip_encode_text
 from rvt.utils.lr_sched_utils import GradualWarmupScheduler
 
+from uncertainty_module.src.base.calib_scaling import CalibScaler
+from uncertainty_module.action_selection import ActionSelection
+import pdb
+import torch.nn.functional as F
 
 def eval_con(gt, pred):
     assert gt.shape == pred.shape, print(f"{gt.shape} {pred.shape}")
@@ -332,9 +336,11 @@ class RVTAgent:
 
         self.num_all_rot = self._num_rotation_classes * 3
 
-    def build(self, training: bool, device: torch.device = None):
+    def build(self, training: bool, device: torch.device = None, calib_scaler: CalibScaler = None, action_selection: ActionSelection = None):
         self._training = training
         self._device = device
+        self.calib_scaler = calib_scaler
+        self.action_selection = action_selection
 
         if self._optimizer_type == "lamb":
             # From: https://github.com/cybertronai/pytorch-lamb/blob/master/pytorch_lamb/lamb.py
@@ -483,6 +489,9 @@ class RVTAgent:
             1,
             self._net_mod.proprio_dim,
         )
+        if self.calib_scaler != None:
+            backprop = False
+        
 
         # sample
         action_rot_grip = replay_sample["rot_grip_action_indicies"][
@@ -568,7 +577,6 @@ class RVTAgent:
                 img_aug = 0
 
             dyn_cam_info = None
-
         out = self._network(
             pc=pc,
             img_feat=img_feat,
@@ -593,8 +601,135 @@ class RVTAgent:
         action_trans = self.get_action_trans(
             wpt_local, pts, out, dyn_cam_info, dims=(bs, nc, h, w)
         )
+        
+        # (Pdb) p q_trans.shape
+        # torch.Size([1, 48400, 5])
+        # (Pdb) p action_trans.shape
+        # torch.Size([1, 48400, 5])
+        
+        q_trans_reverted = q_trans.transpose(2, 1).view(bs, nc, h, w)
+        action_trans_reverted = action_trans.transpose(2, 1).view(bs, nc, h, w)
+        
+        # Compute the argmax for the entire batch and channel dimensions.
+        max_indices_q = torch.argmax(q_trans_reverted.view(bs, nc, -1), dim=2)
+        max_indices_a = torch.argmax(action_trans_reverted.view(bs, nc, -1), dim=2)
 
+        # Convert the flattened indices to row and column indices.
+        q_rows = max_indices_q // w
+        q_cols = max_indices_q % w
+
+        a_rows = max_indices_a // w
+        a_cols = max_indices_a % w
+
+
+        # Compute the squared differences.
+        row_diffs = (q_rows - a_rows)**2
+        col_diffs = (q_cols - a_cols)**2
+
+        # Compute the Euclidean distance for each pair.
+        distances = torch.sqrt(row_diffs + col_diffs).float()
+
+        # Calculate the mean distance.
+        mean_distance = distances.mean()
+
+        
+
+        # pdb.set_trace()
+        # logits = [q_trans, rot_q, grip_q, collision_q]
+        # labels = [action_trans, 
+        #           action_rot_x_one_hot,
+        #           action_rot_y_one_hot,
+        #           action_rot_z_one_hot,
+        #           action_grip_one_hot,  # (bs, 2)
+        #           action_collision_one_hot]
+        
+        
+        # udpate the confidence
+        # import pdb
+        # pdb.set_trace()
+        q_trans_after, rot_q_after, grip_q_after, collision_q_after = self.calib_scaler.scale_logits([q_trans, rot_q, grip_q, collision_q])
+        logits = [q_trans_after, rot_q_after, grip_q_after, collision_q_after]
+        labels = [action_trans, 
+                action_rot_x_one_hot,
+                action_rot_y_one_hot,
+                action_rot_z_one_hot,
+                action_grip_one_hot,  # (bs, 2)
+                action_collision_one_hot]
+        
+        if self.calib_scaler.training:
+            calib_loss = self.calib_scaler.compute_loss(logits, labels)
+            print('calib_loss', calib_loss)
+            print(self.calib_scaler.compute_loss([q_trans, rot_q, grip_q, collision_q], labels))
+            self.calib_scaler.optimizer.zero_grad()
+            calib_loss.backward()
+            self.calib_scaler.optimizer.step()
+            self.calib_scaler.scheduler.step()
+
+            after_calib_loss = self.calib_scaler.compute_loss(self.calib_scaler.scale_logits(logits), labels).item()
+        else:
+            calib_loss = self.calib_scaler.compute_loss(logits, labels)
+
+
+        if self.calib_scaler.calib_type == 'temperature':
+            
+            pred_wpt, pred_rot_quat, pred_grip, pred_coll, pred_wpt_conf = self.get_pred(
+                out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
+            )
+        
+            continuous_action = np.concatenate(
+                (
+                    pred_wpt[0].cpu().numpy(),
+                    pred_rot_quat[0],
+                    pred_grip[0].cpu().numpy(),
+                    pred_coll[0].cpu().numpy(),
+                )
+            )
+            # print('~~~~')
+            # print('-----------------predicted action-----------------')
+            # # print(out.shape)
+            
+            # print(f'pred_wpt: {pred_wpt}\n pred_rot_quat: {pred_rot_quat}\n pred_grip {pred_grip}\n pred_coll {pred_coll}')
+            # print(f'GT:\n {wpt}\n, {action_rot}\n, {action_grip}\n, {action_ignore_collisions}')
+            # print(f'loss {calib_loss}')
+            
+            wpt = torch.cat([x.unsqueeze(0) for x in wpt])
+            pred_wpt, pred_rot_quat, _, _, _ = self.get_pred(
+                out,
+                rot_q,
+                grip_q,
+                collision_q,
+                y_q,
+                rev_trans,
+                dyn_cam_info=dyn_cam_info,
+            )
+
+            eval_log = manage_eval_log(
+                self=self,
+                tasks=tasks,
+                wpt=wpt,
+                pred_wpt=pred_wpt,
+                action_rot=action_rot,
+                pred_rot_quat=pred_rot_quat,
+                action_grip_one_hot=action_grip_one_hot,
+                grip_q=grip_q,
+                action_collision_one_hot=action_collision_one_hot,
+                collision_q=collision_q,
+                reset_log=reset_log,
+            )
+            # pdb.set_trace()
+            # print('-----------------')
+            # exit()
+            calib_info = {'calib_loss': calib_loss.item(),
+                'temperature': self.calib_scaler.temperature.item(),
+                'pred_wpt_conf': pred_wpt_conf,
+                'mean_distance': mean_distance,
+                'eval_log': eval_log
+                }
+            return_out.update(calib_info)
+            # print('mean distance', mean_distance.item())
+            # print(return_log)
         loss_log = {}
+
         if backprop:
             # cross-entropy loss
             trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()
@@ -657,7 +792,7 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
-                "lr": self._optimizer.param_groups[0]["lr"],
+                "lr": self._optimizer.param_groups[0]["lr"]
             }
             manage_loss_log(self, loss_log, reset_log=reset_log)
             return_out.update(loss_log)
@@ -665,7 +800,7 @@ class RVTAgent:
         if eval_log:
             with torch.no_grad():
                 wpt = torch.cat([x.unsqueeze(0) for x in wpt])
-                pred_wpt, pred_rot_quat, _, _ = self.get_pred(
+                pred_wpt, pred_rot_quat, _, _, _ = self.get_pred(
                     out,
                     rot_q,
                     grip_q,
@@ -745,12 +880,103 @@ class RVTAgent:
             lang_emb=lang_goal_embs,
             img_aug=0,  # no img augmentation while acting
         )
+        
+        # pdb.set_trace()
         _, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
             out, dims=(bs, nc, h, w), only_pred=True
         )
-        pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(
-            out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
-        )
+        
+        
+        
+        
+        if self.action_selection.enabled:
+            # scale the logits
+
+            out_after = out.copy()
+            out_after_calib = out.copy()
+            out_after_calib['trans'], rot_q_after, grip_q_after, collision_q_after = self.calib_scaler.scale_logits([out['trans'], rot_q, grip_q, collision_q])
+            
+            ## softmax the translation calibration
+            # Get the shape of the tensor
+            shape = out_after_calib['trans'].shape
+            # Reshape the tensor to merge the last two dimensions
+            merged_tensor = out_after_calib['trans'].reshape(-1, shape[-2] * shape[-1])
+            softmaxed_tensor = F.softmax(merged_tensor, dim=-1)# Apply softmax over the merged dimension
+            out_after_calib['trans'] = softmaxed_tensor.reshape(shape)# Reshape back to the original shape
+
+            # out_after_calib['trans'] = F.softmax(out_after_calib['trans'], dim=-1)
+            rot_q_after_3 = rot_q_after.view(3,-1)
+            rot_q_after = F.softmax(rot_q_after_3,dim=1).view(rot_q_after.shape)
+            # rot_q_after = F.softmax(rot_q_after, dim=-1)
+
+            grip_q_after = F.softmax(grip_q_after, dim=-1)
+            collision_q_after = F.softmax(collision_q_after, dim=-1)
+            
+            # get uncertainty map from heatmap
+            out_after['trans'] = self.action_selection.get_uncertainty_heatmap(out_after_calib['trans'])
+            if self.action_selection.use_ua_rot:
+                rot_q_after = self.action_selection.get_uncertainty_rot(rot_q_after, self._num_rotation_classes)
+
+            # use uncertainty map for pred_wpt
+            pred_wpt, pred_rot_quat, pred_grip, pred_coll, _ = self.get_pred(
+                out_after, rot_q_after, grip_q_after, collision_q_after, y_q, rev_trans, dyn_cam_info
+            )
+            # _pred_wpt, _pred_rot_quat, _pred_grip, _pred_coll, _ = self.get_pred(
+            #     out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
+            # )
+            # if not all((pred_wpt==_pred_wpt)[0]):
+            #     import pdb
+            #     pdb.set_trace()
+        else:
+            print('not using self.action_selection.enabled')
+            pred_wpt, pred_rot_quat, pred_grip, pred_coll, _ = self.get_pred(
+                out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
+            )
+            
+
+        if self.action_selection and self.action_selection.uncertainty_measure:
+            out_after_calib = out.copy()
+            out_after_calib['trans'], rot_q_after, grip_q_after, collision_q_after = self.calib_scaler.scale_logits([out['trans'], rot_q, grip_q, collision_q])
+            
+            out_trans_soft = F.softmax(out_after_calib['trans'].view(1,5,-1), dim=2) # this is what rvt did in get_wpt
+            rot_q_soft = F.softmax(rot_q_after.view(3,-1), dim=1)
+            
+            hm_entropies = -torch.sum(out_trans_soft * torch.log2(out_trans_soft + 1e-10), dim=2).mean().item()
+            rot_entropies = -torch.sum(rot_q_soft * torch.log2(rot_q_soft + 1e-10), dim=0).mean().item()
+            hm_var = torch.var(out_trans_soft, dim=2).mean().item()
+            rot_var = torch.var(rot_q_soft, dim=0).mean().item()
+            
+            grip_soft = F.softmax(grip_q_after, dim=1)
+            grip_entropy = -torch.sum(grip_soft * torch.log2(grip_soft+1e-10)).item()
+            grip_var = torch.var(grip_soft).item()
+            
+            collision_soft = F.softmax(collision_q_after, dim=1)
+            collision_entropy = -torch.sum(collision_soft * torch.log2(collision_soft+1e-10)).item()
+            collision_var = torch.var(collision_soft).item()
+            
+            out_soft = out.copy()
+            out_soft['trans'] = F.softmax(out_after_calib['trans'].view(1,5,-1), dim=2).view(out_after_calib['trans'].shape)
+            
+            pred_wpt_conf, pred_rot_conf, pred_grip_conf, pred_coll_conf = self.get_scores_pred(
+                out_soft, rot_q_soft.view(rot_q_after.shape), grip_soft, collision_soft, y_q, rev_trans, dyn_cam_info
+            )
+            info = {
+                'hm_entropies': hm_entropies,
+                'rot_entropies': rot_entropies,
+                'grip_entropy': grip_entropy,
+                'collision_entropy': collision_entropy,
+                'hm_var': hm_var,
+                'rot_var': rot_var,
+                'grip_var': grip_var,
+                'collision_var': collision_var,
+                'pred_wpt_conf': pred_wpt_conf,
+                'pred_rot_conf': torch.prod(pred_rot_conf).item(),
+                'pred_grip_conf': pred_grip_conf,
+                'pred_coll_conf': pred_coll_conf
+            }
+            
+        else:
+            info = None
 
         continuous_action = np.concatenate(
             (
@@ -777,9 +1003,74 @@ class RVTAgent:
                 x_distri.cpu().numpy(),
                 y_distri.cpu().numpy(),
                 z_distri.cpu().numpy(),
-            )
+            ), info
         else:
-            return ActResult(continuous_action)
+            return ActResult(continuous_action), _, info
+
+    def get_rot_grip_coll_confidence(self, rot_q, grip_q, collision_q, pred_rot, pred_grip, pred_coll):
+        # Adjusting indices for pred_rot to account for segmented classes
+        adjusted_indices = torch.cat([
+            pred_rot[:, 0].unsqueeze(1) + 0 * self._num_rotation_classes,
+            pred_rot[:, 1].unsqueeze(1) + 1 * self._num_rotation_classes,
+            pred_rot[:, 2].unsqueeze(1) + 2 * self._num_rotation_classes
+        ], dim=1)
+
+        # Extracting the corresponding maximum values for rot_q
+        pred_rot_max_values = torch.cat([
+            rot_q[torch.arange(rot_q.size(0)), adjusted_indices[:, 0]].unsqueeze(-1),
+            rot_q[torch.arange(rot_q.size(0)), adjusted_indices[:, 1]].unsqueeze(-1),
+            rot_q[torch.arange(rot_q.size(0)), adjusted_indices[:, 2]].unsqueeze(-1)
+        ], dim=1)
+
+        # Extracting the corresponding maximum values for grip_q
+        pred_grip_max_values = grip_q.gather(1, pred_grip)
+        
+        pred_coll_max_values = collision_q.gather(1, pred_coll)
+        return pred_rot_max_values, pred_grip_max_values, pred_coll_max_values
+
+    def get_scores_pred(
+        self,
+        out,
+        rot_q,
+        grip_q,
+        collision_q,
+        y_q,
+        rev_trans,
+        dyn_cam_info,
+    ):
+        pred_wpt_local, pred_wpt_conf = self._net_mod.get_wpt(out, dyn_cam_info, y_q)
+
+        pred_wpt = []
+        for _pred_wpt_local, _rev_trans in zip(pred_wpt_local, rev_trans):
+            pred_wpt.append(_rev_trans(_pred_wpt_local))
+        pred_wpt = torch.cat([x.unsqueeze(0) for x in pred_wpt])
+        # pdb.set_trace()
+        pred_rot = torch.cat(
+            (
+                rot_q[
+                    :,
+                    0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+                rot_q[
+                    :,
+                    1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+                rot_q[
+                    :,
+                    2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+            ),
+            dim=-1,
+        )
+        pred_rot_quat = aug_utils.discrete_euler_to_quaternion(
+            pred_rot.cpu(), self._rotation_resolution
+        )
+        pred_grip = grip_q.argmax(1, keepdim=True)
+        pred_coll = collision_q.argmax(1, keepdim=True)
+        
+        pred_rot_max_values, pred_grip_max_values, pred_coll_max_values = self.get_rot_grip_coll_confidence(rot_q, grip_q, collision_q, pred_rot, pred_grip, pred_coll)
+
+        return pred_wpt_conf[0].item(), pred_rot_max_values[0], pred_grip_max_values.item(), pred_coll_max_values.item()
 
     def get_pred(
         self,
@@ -791,13 +1082,13 @@ class RVTAgent:
         rev_trans,
         dyn_cam_info,
     ):
-        pred_wpt_local = self._net_mod.get_wpt(out, dyn_cam_info, y_q)
+        pred_wpt_local, pred_wpt_conf = self._net_mod.get_wpt(out, dyn_cam_info, y_q)
 
         pred_wpt = []
         for _pred_wpt_local, _rev_trans in zip(pred_wpt_local, rev_trans):
             pred_wpt.append(_rev_trans(_pred_wpt_local))
         pred_wpt = torch.cat([x.unsqueeze(0) for x in pred_wpt])
-
+        # pdb.set_trace()
         pred_rot = torch.cat(
             (
                 rot_q[
@@ -821,7 +1112,7 @@ class RVTAgent:
         pred_grip = grip_q.argmax(1, keepdim=True)
         pred_coll = collision_q.argmax(1, keepdim=True)
 
-        return pred_wpt, pred_rot_quat, pred_grip, pred_coll
+        return pred_wpt, pred_rot_quat, pred_grip, pred_coll, pred_wpt_conf
 
     def get_action_trans(
         self,

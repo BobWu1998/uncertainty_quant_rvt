@@ -39,14 +39,33 @@ from rvt.utils.peract_utils import (
     DATA_FOLDER,
 )
 
+from uncertainty_module.src.base.calib_scaling import CalibScaler
+from uncertainty_module.src.temperature_scaling.temperature_scaling import TemperatureScaler
+import wandb
+import shutil
+
+
 # new train takes the dataset as input
-def train(agent, dataset, training_iterations, rank=0):
-    agent.train()
+def train(agent, dataset, training_iterations, rank=0, tasks=None):
+    print('training????????', agent.calib_scaler.training)
+    if agent.calib_scaler != None:
+        agent.eval()
+        if agent.calib_scaler.training:
+            run = wandb.init(project='rvt_'+agent.calib_scaler.calib_type+'_train', entity='bobwupenn', name=tasks[0])
+        else:
+            agent.calib_scaler.load_parameter(task_name=tasks[0])
+            print('loaded pretrained temperature: ', agent.calib_scaler.temperature)
+    else:
+        agent.train()
+    
     log = defaultdict(list)
 
     data_iter = iter(dataset)
     iter_command = range(training_iterations)
-
+    reliability_results = {
+            'confidence': [],
+            'matching_labels': []
+        }
     for iteration in tqdm.tqdm(
         iter_command, disable=(rank != 0), position=0, leave=True
     ):
@@ -70,8 +89,32 @@ def train(agent, dataset, training_iterations, rank=0):
                 "eval_log": False,
             }
         )
-        agent.update(**update_args)
 
+        infos = agent.update(**update_args)
+        # import pdb
+        # pdb.set_trace()
+        if agent.calib_scaler.training:
+            if agent.calib_scaler.calib_type == 'temperature':
+                wandb.log({'epoch loss': infos['calib_loss'], 'temperature': infos['temperature']})
+        print('mean_distance', infos['mean_distance'])
+        print('eval_log', infos['eval_log'])
+
+        path = '/home/bobwu/shared/rvt/temp_eval_v3'
+        task_name = tasks[0]
+        path = os.path.join(path, task_name)
+        if os.path.exists(path):
+            shutil.rmtree(path)
+        os.makedirs(path)
+        torch.save(reliability_results, path+'/results.pth')
+        reliability_results['confidence'].append(infos['pred_wpt_conf'])
+        reliability_results['matching_labels'].append(infos['mean_distance'])
+        
+    print(sum([x == 0 for x in reliability_results['matching_labels']]))
+
+    if agent.calib_scaler.training:
+        # torch.save(temp_scaler, temp_log_path+self._task_name+'_temperature.pth')
+        agent.calib_scaler.save_parameter(task_name=tasks[0])
+        run.finish()
     if rank == 0:
         log = print_loss_log(agent)
 
@@ -164,14 +207,20 @@ def experiment(rank, cmd_args, devices, port):
 
     # Things to change
     BATCH_SIZE_TRAIN = exp_cfg.bs
-    NUM_TRAIN = 100
+    # NUM_TRAIN = 100
+    NUM_TRAIN = 25 # 100 TODO: make this the # of eps in calibration set
     # to match peract, iterations per epoch
-    TRAINING_ITERATIONS = int(10000 // (exp_cfg.bs * len(devices) / 16))
+    # TRAINING_ITERATIONS = int(10000 // (exp_cfg.bs * len(devices) / 16))
+    TRAINING_ITERATIONS = cmd_args.calib_iters
+    print('training iters', TRAINING_ITERATIONS)
     EPOCHS = exp_cfg.epochs
     TRAIN_REPLAY_STORAGE_DIR = "replay/replay_train"
     TEST_REPLAY_STORAGE_DIR = "replay/replay_val"
     log_dir = get_logdir(cmd_args, exp_cfg)
     tasks = get_tasks(exp_cfg)
+    # calibrating temperature for each task seperately
+    if cmd_args.scaler_type != None:
+        tasks = cmd_args.task.split(",")
     print("Training on {} tasks: {}".format(len(tasks), tasks))
 
     t_start = time.time()
@@ -224,7 +273,25 @@ def experiment(rank, cmd_args, devices, port):
             **exp_cfg.peract,
             **exp_cfg.rvt,
         )
-        agent.build(training=True, device=device)
+        print('calibrating???', cmd_args.calibrating)
+        if cmd_args.scaler_type == "temperature":
+            calib_scaler = TemperatureScaler(device = cmd_args.device,
+                                             training = cmd_args.calibrating,
+                                             training_iter = cmd_args.calib_iters,
+                                             scaler_log_root = cmd_args.calib_log_path,
+                                             calib_type = cmd_args.scaler_type,
+                                             batch_size=BATCH_SIZE_TRAIN,
+                                             add_rgc_loss=exp_cfg.peract.add_rgc_loss
+                                            )
+        else:
+            calib_scaler = None
+        
+        agent.build(training=False, device=device, calib_scaler=calib_scaler, action_selection=None)
+        
+        from rvt.utils.rvt_utils import load_agent as load_agent_state
+        model_path = '/home/bobwu/UQ/RVT/rvt/runs/rvt/model_14.pth'
+        load_agent_state(model_path, agent)
+        agent.eval()
     else:
         assert False, "Incorrect agent"
 
@@ -257,7 +324,7 @@ def experiment(rank, cmd_args, devices, port):
             break
 
         print(f"Rank [{rank}], Epoch [{i}]: Training on train dataset")
-        out = train(agent, train_dataset, TRAINING_ITERATIONS, rank)
+        out = train(agent, train_dataset, TRAINING_ITERATIONS, rank, tasks)
 
         if rank == 0:
             tb.update("train", i, out)
@@ -287,6 +354,17 @@ if __name__ == "__main__":
 
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--with-eval", action="store_true", default=False)
+    
+    parser.add_argument("--task", type=str, default=None)
+    
+    parser.add_argument("--scaler_type", type=str, default="temperature")
+    
+    def str2bool(v):
+        return v.lower() in ('yes', 'true', 't', 'y', '1')
+    parser.add_argument("--calibrating", type=str2bool, default=False)
+
+    parser.add_argument("--calib_log_path", type=str, default=None)
+    parser.add_argument("--calib_iters", type=int, default=10)
 
     cmd_args = parser.parse_args()
     del (
@@ -297,4 +375,5 @@ if __name__ == "__main__":
     devices = [int(x) for x in devices]
 
     port = (random.randint(0, 3000) % 3000) + 27000
-    mp.spawn(experiment, args=(cmd_args, devices, port), nprocs=len(devices), join=True)
+    # mp.spawn(experiment, args=(cmd_args, devices, port), nprocs=len(devices), join=True)
+    experiment(0, cmd_args, devices, port)

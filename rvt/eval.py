@@ -50,6 +50,10 @@ from rvt.utils.rvt_utils import (
 )
 from rvt.utils.rvt_utils import load_agent as load_agent_state
 
+from uncertainty_module.src.base.calib_scaling import CalibScaler
+from uncertainty_module.src.temperature_scaling.temperature_scaling import TemperatureScaler
+from uncertainty_module.action_selection import ActionSelection
+from uncertainty_module.utils.uncertainty_measure import UncertaintyMeasurement
 
 def load_agent(
     model_path=None,
@@ -60,6 +64,7 @@ def load_agent(
     eval_log_dir="",
     device=0,
     use_input_place_with_mean=False,
+    args=None
 ):
     device = f"cuda:{device}"
 
@@ -153,8 +158,37 @@ def load_agent(
             )
         else:
             raise NotImplementedError
-
-        agent.build(training=False, device=device)
+        
+        if args.scaler_type == "temperature":
+            BATCH_SIZE_TRAIN=1
+            calib_scaler = TemperatureScaler(device = args.device,
+                                             training = args.calibrating,
+                                             training_iter = args.calib_iters,
+                                             scaler_log_root = args.calib_log_path,
+                                             calib_type = args.scaler_type,
+                                             batch_size=BATCH_SIZE_TRAIN,
+                                             add_rgc_loss=exp_cfg.peract.add_rgc_loss,
+                                             use_hard_temp=args.use_hard_temp # need to add default "use_hard_temp" for older bash scripts
+                                            )
+        else:
+            calib_scaler = None
+        
+        
+        action_selection = ActionSelection(device = args.device,
+                                            batch_size = BATCH_SIZE_TRAIN,
+                                            tau = args.tau,
+                                            log_dir = args.ua_action_log_dir,
+                                            enabled = args.ua_action_enabled,
+                                            action_type = args.ua_action_type,
+                                            tau_rot = args.tau_rot,
+                                            use_ua_rot = args.use_ua_rot,
+                                            sigma = args.sigma,
+                                            uncertainty_measure = args.uncertainty_measure
+                                            )
+        
+        agent.build(training=False, device=device, calib_scaler=calib_scaler, action_selection=action_selection)
+        # agent.build(training=False, device=device)
+        
         load_agent_state(model_path, agent)
         agent.eval()
 
@@ -246,6 +280,8 @@ def eval(
                 fieldnames = ["task", "success rate", "length", "total_transitions"]
                 csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
                 csv_writer.writeheader()
+    
+    
 
     # evaluate agent
     rollout_generator = RolloutGenerator(device)
@@ -257,12 +293,22 @@ def eval(
 
     num_tasks = len(tasks)
     step_signal = Value("i", -1)
-
+    
+    
+    
     scores = []
     for task_id in range(num_tasks):
+        # load the calibration parameters
+        agent.calib_scaler.load_parameter(task_name=tasks[task_id])
         task_rewards = []
+        if agent.action_selection.uncertainty_measure:
+            um = UncertaintyMeasurement()
         for ep in range(start_episode, start_episode + eval_episodes):
             episode_rollout = []
+            
+            if agent.action_selection.uncertainty_measure:
+                um.episode_reset()
+                
             generator = rollout_generator.generator(
                 step_signal=step_signal,
                 env=eval_env,
@@ -275,7 +321,11 @@ def eval(
                 replay_ground_truth=replay_ground_truth,
             )
             try:
-                for replay_transition in generator:
+                for replay_transition, info in generator:
+                    if info:
+                        if agent.action_selection.uncertainty_measure:
+                            um.episode_update(info)
+                        
                     episode_rollout.append(replay_transition)
             except StopIteration as e:
                 continue
@@ -296,6 +346,8 @@ def eval(
                 print(
                     f"Evaluating {task_name} | Episode {ep} | Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
                 )
+            if agent.action_selection.uncertainty_measure:
+                um.task_update(reward)
 
         # report summaries
         summaries = []
@@ -330,13 +382,38 @@ def eval(
             task_score = "unknown"
 
         print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
+        
+        ## adding log for current episode
+        tau = agent.action_selection._tau
 
+        # Create a file name based on tau, search_size, and search_step
+        if agent.action_selection.enabled:
+            action_type = 'safe'
+        else:
+            action_type = 'best'
+        file_name = f"tau_{tau}_{action_type}.txt"
+
+        # Full path to the file
+        file_path = agent.action_selection.log_dir
+        # Ensure the directory exists
+        directory = os.path.dirname(file_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        # Write the output to the file
+        with open(file_path+file_name, 'w') as f:
+            f.write(f"tau: {tau}\n")
+            f.write(f"Finished {task_name} | Final Score: {task_score}\n")
+        ## end adding log for current episode
+        if agent.action_selection.uncertainty_measure:
+            um.save_results(file_path, file_name, task_name)
+        
         scores.append(task_score)
 
         if save_video:
             video_image_folder = "./tmp"
             record_fps = 25
             record_folder = os.path.join(log_dir, "videos")
+            print('record_folder', record_folder)
             os.makedirs(record_folder, exist_ok=True)
             video_success_cnt = 0
             video_fail_cnt = 0
@@ -476,6 +553,7 @@ def _eval(args):
                 eval_log_dir=args.eval_log_dir,
                 device=args.device,
                 use_input_place_with_mean=args.use_input_place_with_mean,
+                args=args
             )
 
             agent_eval_log_dir = os.path.join(
@@ -520,7 +598,24 @@ def _eval(args):
 
 if __name__ == "__main__":
     parser = get_eval_parser()
-
+    
+    parser.add_argument("--task", type=str, default=None)
+    parser.add_argument("--scaler_type", type=str, default="temperature")
+    def str2bool(v):
+        return v.lower() in ('yes', 'true', 't', 'y', '1')
+    parser.add_argument("--calibrating", type=str2bool, default=False)
+    parser.add_argument("--calib_log_path", type=str, default=None)
+    parser.add_argument("--calib_iters", type=int, default=10)
+    parser.add_argument("--tau", type=int, default=3)
+    parser.add_argument("--ua_action_log_dir", type=str, default=None)
+    parser.add_argument("--ua_action_enabled", type=str2bool, default=False)
+    parser.add_argument("--ua_action_type", type=str, default=None)
+    parser.add_argument("--tau_rot", type=int, default=3)
+    parser.add_argument("--use_ua_rot", type=str2bool, default=False)
+    parser.add_argument("--sigma", type=int, default=3)
+    parser.add_argument("--uncertainty_measure", type=str2bool, default=False)
+    parser.add_argument("--save_video", type=str2bool, default=False)
+    parser.add_argument("--use_hard_temp", type=str2bool, default=False)
     args = parser.parse_args()
 
     if args.log_name is None:
@@ -536,5 +631,7 @@ if __name__ == "__main__":
     # save the arguments for future reference
     with open(os.path.join(args.eval_log_dir, "eval_config.yaml"), "w") as fp:
         yaml.dump(args.__dict__, fp)
+    
+
 
     _eval(args)

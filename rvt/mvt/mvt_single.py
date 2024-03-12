@@ -442,6 +442,7 @@ class MVT(nn.Module):
 
         q_trans = out["trans"].view(bs, nc, h * w)
         hm = torch.nn.functional.softmax(q_trans, 2)
+
         hm = hm.view(bs, nc, h, w)
 
         if dyn_cam_info is None:
@@ -449,7 +450,19 @@ class MVT(nn.Module):
         else:
             dyn_cam_info_itr = dyn_cam_info
 
-        pred_wpt = [
+        # pred_wpt = [
+        #     self.renderer.get_max_3d_frm_hm_cube(
+        #         hm[i : i + 1],
+        #         fix_cam=True,
+        #         dyn_cam_info=dyn_cam_info_itr[i : i + 1]
+        #         if not (dyn_cam_info_itr[i] is None)
+        #         else None,
+        #     )
+        #     for i in range(bs)
+        # ]
+        
+        # Using list comprehension to unpack tuples into two separate lists
+        pred_wpt, pred_wpt_conf = zip(*[
             self.renderer.get_max_3d_frm_hm_cube(
                 hm[i : i + 1],
                 fix_cam=True,
@@ -458,12 +471,13 @@ class MVT(nn.Module):
                 else None,
             )
             for i in range(bs)
-        ]
+        ])
+
         pred_wpt = torch.cat(pred_wpt, 0)
 
         assert y_q is None
 
-        return pred_wpt
+        return pred_wpt, pred_wpt_conf
 
     def free_mem(self):
         """
