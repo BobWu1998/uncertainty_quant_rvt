@@ -7,6 +7,7 @@
 [submodule "libs/YARR"]
 	path = rvt/libs/YARR
         url = https://github.com/anonymous23099/YARR.git
+        branch = rvt
 [submodule "libs/peract"]
 	path = rvt/libs/peract
         url = https://github.com/NVlabs/peract.git
