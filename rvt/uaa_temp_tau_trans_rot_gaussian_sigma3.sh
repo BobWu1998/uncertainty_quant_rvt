@@ -21,12 +21,13 @@ tasks=(
     place_wine_at_rack_location 
     open_drawer
 )
-taus=(3 5)
+
+taus=(3)
 for tau in "${taus[@]}"; do
     for t in "${tasks[@]}"; do
         CUDA_VISIBLE_DEVICES=2 python eval.py \
-        --model-folder /home/bobwu/UQ/RVT/rvt/runs/rvt \
-        --eval-datafolder /home/bobwu/UQ/peract_headless/peract_reliability/data/extended \
+        --model-folder $PATH_TO_MODEL \
+        --eval-datafolder $PATH_TO_RLBench_Data \
         --tasks $t \
         --eval-episodes 100 \
         --log-name test/1 \
@@ -35,8 +36,8 @@ for tau in "${taus[@]}"; do
         --model-name model_14.pth \
         --scaler_type temperature \
         --calibrating False \
-        --calib_log_path /home/bobwu/shared/rvt/temp_train_v2 \
-        --ua_action_log_dir "/home/bobwu/shared/rvt/uaa_conf100_trained_indiv_temp_gaussian_trans_rot_sigma3/${t}/" \
+        --calib_log_path $PATH_TO_TEMP \
+        --ua_action_log_dir $PATH_TO_LOG \
         --ua_action_enabled True \
         --tau $tau \
         --use_ua_rot True \

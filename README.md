@@ -1,3 +1,36 @@
+## Installation
+You can follow the exact installation instruction in the [RVT repository](https://github.com/NVlabs/RVT.githttps://github.com/NVlabs/RVT.git) to prepare the environment
+
+## Model Preparation
+Download the [pre-trained weights]((https://drive.google.com/drive/folders/1lf1znYM5I-_WSooR4VeJjzvydINWPj6B?usp=sharing)) from for the RVT model. Then, place the model (model_14.pth trained for 15 epochs or 100K steps) and the config files under the folder ```runs/rvt/```. You can call this as **$PATH_TO_MODEL**
+
+Download the [temperature weights](https://drive.google.com/drive/folders/1qxnWxVnORsT6F1zojyvYCVNnAEez2M68?usp=sharing) and place it under self-defined path **$PATH_TO_TEMP**
+
+## Data Generation
+You can directly use the data generated from RLBench following the step in PerAct. You should set the directory as **$PATH_TO_RLBench_Data**
+
+## Evaluation
+Before running the evaluation code, you need to properly set the directory in the bash file ```uaa_bash.sh``` and ```uaa_temp_tau_trans_rot_gaussian_sigma3.sh```
+
+**$PATH_TO_MODEL** \
+**$PATH_TO_TEMP** \
+**$PATH_TO_RLBench_Data** \
+**$PATH_TO_LOG_BASE** \
+**$PATH_TO_LOG**
+
+You can run the following command to launch the evaluation of original RVT by
+```
+bash uaa_bash.sh
+```
+and run the command below for RVT with our method
+```
+bash uaa_temp_tau_trans_rot_gaussian_sigma3.sh
+```
+
+
+
+<!-- 
+
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/rvt-robotic-view-transformer-for-3d-object/robot-manipulation-on-rlbench)](https://paperswithcode.com/sota/robot-manipulation-on-rlbench?p=rvt-robotic-view-transformer-for-3d-object)
 
 <div style="margin: 20px;">
@@ -181,4 +214,4 @@ We sincerely thank the authors of the following repositories for sharing their c
 License Copyright © 2023, NVIDIA Corporation & affiliates. All rights reserved.
 
 This work is made available under the [Nvidia Source Code License](https://github.com/NVlabs/RVT/blob/master/LICENSE).
-The [pretrained RVT model](https://drive.google.com/drive/folders/1lf1znYM5I-_WSooR4VeJjzvydINWPj6B?usp=sharing) is released under the CC-BY-NC-SA-4.0 license.
+The [pretrained RVT model](https://drive.google.com/drive/folders/1lf1znYM5I-_WSooR4VeJjzvydINWPj6B?usp=sharing) is released under the CC-BY-NC-SA-4.0 license. -->
