@@ -10,7 +10,7 @@ Download the [temperature weights](https://drive.google.com/drive/folders/1qxnWx
 You can directly use the data generated from RLBench following the step in PerAct. You should set the directory as **$PATH_TO_RLBench_Data**
 
 ## Evaluation
-Before running the evaluation code, you need to properly set the directory in the bash file ```uaa_bash.sh``` and ```uaa_temp_tau_trans_rot_gaussian_sigma3.sh```
+Before running the evaluation code, you need to properly set the directory in the bash file ```rvt/uaa_bash.sh``` and ```rvt/uaa_temp_tau_trans_rot_gaussian_sigma3.sh```
 
 **$PATH_TO_MODEL** \
 **$PATH_TO_TEMP** \
